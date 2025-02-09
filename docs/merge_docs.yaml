@@ -1,0 +1,28 @@
+sources:
+  - name: Github Workshop Reference
+    type: github
+    repo_url: https://github.com/canonical/workshop.git
+    branch: main
+    doc_subdir: docs/reference/
+    dest_dir: workshop/
+
+  - name: Discourse MAAS
+    type: discourse
+    discourse_url: https://discourse.maas.io
+    pages:
+      - topic_id: 5360
+        title: MAAS in 30 minutes
+        filename: maas-in-30-minutes.md
+    dest_dir: maas/
+
+  - name: Discourse Robotics
+    type: discourse
+    discourse_url: https://discourse.ubuntu.com
+    pages:
+      - topic_id: 26206
+        title: ESM introduction
+        filename: ros-esm-user-introduction.md
+      - topic_id: 34704
+        title: Packaging ROS snaps
+        filename: part-1-packaging-our-first-ros-application-as-a-snap.md
+    dest_dir: ros/
