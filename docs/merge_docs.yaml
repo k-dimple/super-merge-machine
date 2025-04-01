@@ -1,9 +1,13 @@
 sources:
   - name: Github Workshop Reference
     type: github
-    repo_url: https://github.com/canonical/workshop.git
+    repo_url: git@github.com:canonical/workshop.git
     branch: main
     doc_subdir: docs/reference/
+    pages:
+    - doc_file: sdks.rst
+    - doc_file: workshops.rst
+      filename: ws.rst
     dest_dir: workshop/
 
   - name: Discourse MAAS
@@ -14,6 +18,7 @@ sources:
         title: MAAS in 30 minutes
         filename: maas-in-30-minutes.md
     dest_dir: maas/
+    category: "Discourse"
 
   - name: Discourse Robotics
     type: discourse
@@ -26,3 +31,4 @@ sources:
         title: Packaging ROS snaps
         filename: part-1-packaging-our-first-ros-application-as-a-snap.md
     dest_dir: ros/
+    category: "Discourse"
