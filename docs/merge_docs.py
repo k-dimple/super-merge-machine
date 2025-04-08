@@ -298,7 +298,7 @@ def build_all_indices(output_dir, source_entries):
         for cat in categories:
             # We'll store the category index at output_dir/<cat>/index.md
             # So from the root's perspective, it’s "<cat>/index"
-            lines.append(f"{cat}/index")
+            lines.append(f"{cat}/index\n")
         lines.append("\n```\n\n")
 
     no_category_sources = cat_map.get(None, [])

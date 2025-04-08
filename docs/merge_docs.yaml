@@ -9,6 +9,7 @@ sources:
     - doc_file: workshops.rst
       filename: ws.rst
     dest_dir: workshop/
+    category: "GitHub"
 
   - name: Discourse MAAS
     type: discourse
