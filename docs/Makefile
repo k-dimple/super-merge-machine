@@ -87,6 +87,7 @@ pa11y-install:
 install: $(VENVDIR)
 
 pull:
+	rm -rf external/
 	. $(VENV); python merge_docs.py --manifest merge_docs.yaml --output external/
 
 run: install
