@@ -11,6 +11,26 @@ sources:
     dest_dir: workshop/
     category: "GitHub"
 
+  - name: Github Workshop CLI
+    type: github
+    repo_url: git@github.com:canonical/workshop.git
+    branch: main
+    doc_subdir: docs/reference/cli/
+    pages:
+    - doc_file: workshop.rst
+    dest_dir: cli/
+    category: "GitHub"
+
+  - name: Github Workshop ROS2
+    type: github
+    repo_url: git@github.com:canonical/workshop.git
+    branch: main
+    doc_subdir: docs/how-to/ros2/
+    pages:
+    - doc_file: ros2-design-sdk.rst
+    dest_dir: ros2/
+    category: "GitHub"
+
   - name: Discourse MAAS
     type: discourse
     discourse_url: https://discourse.maas.io

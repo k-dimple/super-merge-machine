@@ -1,101 +1,226 @@
 #!/usr/bin/env python3
 """
-Merges multiple documentation sources (GitHub/Discourse) into a Sphinx-ready set of .md/.rst files,
-including a root index that groups sources by optional "category" and then by "dest_dir".
+Merges multiple documentation sources (GitHub/Discourse) into a Sphinx-ready set
+of .md/.rst files, including a root index that groups sources by optional
+"category" and then by "dest_dir".
 
-Changelog (refactored):
-1. Allow single (or multiple) page includes from GitHub by specifying 'pages' with 'doc_file' and optional 'filename'.
-2. Permit grouping sources under a named category. Sources sharing a category get a dedicated index.md in a subfolder.
-3. If a source has no category, it remains at the top-level index as before (no category grouping).
+New features (May 2025)
+=======================
+1. Recursive include support: Whenever a file cloned from a GitHub repo
+   contains an `.. include::` or `.. literalinclude::` directive,
+   the referenced file (recursively) is copied into the local documentation
+   tree so that the directive resolves when the docs are built locally.
+2. `reuse/` aggregation: For every GitHub repo that contains `docs/reuse/`
+     with `links.txt` and/or `substitutions.txt`,
+     the corresponding files from all repos are joined under ``reuse/``.
+
+The rest of the behaviour is unchanged.
 """
 
+from __future__ import annotations
+
+import argparse
 import os
+import re
 import shutil
 import tempfile
-import argparse
-import yaml
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Set, Tuple
+
 import requests
+import yaml
 from git import Repo
 
+###############################################################################
+# Helpers                                                                     #
+###############################################################################
 
-def copy_tree(src, dest):
-    """Recursively copy src to dest."""
-    if not os.path.exists(dest):
+# Global accumulator for reuse fragments
+_REUSE_CACHE: Dict[str, List[Tuple[str, List[str]]]] = {"links": [], "substitutions": []}
+
+_INCLUDE_RE = re.compile(r"^\s*\.\.\s+(?:literal)?include::\s+(.+?)\s*$")
+
+###############################################################################
+# Low-level file helpers                                                      #
+###############################################################################
+
+def copy_tree(src: str | Path, dest: str | Path) -> None:
+    """Recursively copy *src* to *dest* (existing files are overwritten)."""
+    src = Path(src)
+    dest = Path(dest)
+
+    if not dest.exists():
         shutil.copytree(src, dest)
         return
+
     for root, dirs, files in os.walk(src):
-        rel_path = os.path.relpath(root, src)
-        dest_path = os.path.join(dest, rel_path)
-        os.makedirs(dest_path, exist_ok=True)
+        rel_root = Path(root).relative_to(src)
+        dest_root = dest / rel_root
+        dest_root.mkdir(parents=True, exist_ok=True)
         for f in files:
-            shutil.copy2(os.path.join(root, f), os.path.join(dest_path, f))
+            shutil.copy2(Path(root) / f, dest_root / f)
 
 
-def copy_file(src_file, dst_file):
-    """Copy a single file from src_file to dst_file, ensuring directories exist."""
-    os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+def copy_file(src_file: str | Path, dst_file: str | Path) -> None:
+    """Copy a single file, ensuring parent directories exist."""
+    dst_file = Path(dst_file)
+    dst_file.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_file, dst_file)
 
+###############################################################################
+# include:: handling                                                          #
+###############################################################################
 
-def build_github_toc(name, dest_dir, doc_files):
+def _scan_includes(file_path: Path) -> List[str]:
+    """Return a list of *relative* paths referenced by ``.. include::`` in *file_path*."""
+    if file_path.suffix.lower() not in {".rst", ".md"}:
+        return []
+
+    includes: List[str] = []
+    try:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                m = _INCLUDE_RE.match(line)
+                if m:
+                    includes.append(m.group(1).strip())
+    except FileNotFoundError:
+        pass  # ignore broken include for now
+    return includes
+
+
+def _copy_includes_recursive(
+    source_root: Path,
+    dest_root: Path,
+    including_file: Path,
+    seen: Set[Path],
+) -> None:
+    """Recursively copy all include targets needed by *including_file*.
+
+    *source_root* is the repo folder; *dest_root* is the local copy location.
+    *including_file* must already have been copied to *dest_root*.
     """
-    If multiple doc files, list them (e.g. "someDir/doc.md").
-    If only 1 doc, label it as "SourceName <someDir/doc.md>".
-    """
-    lines = []
-    if len(doc_files) > 1:
-        for doc_file in doc_files:
-            if dest_dir:
-                lines.append(f"{dest_dir}/{doc_file}")
-            else:
-                lines.append(f"{doc_file}")
-    else:
-        for doc_file in doc_files:
-            if dest_dir:
-                lines.append(f"{name} <{dest_dir}/{doc_file}>")
-            else:
-                lines.append(f"{name} <{doc_file}>")
-    return lines
+    for rel_inc in _scan_includes(including_file):
+        repo_inc_path = (source_root / including_file.relative_to(dest_root).parent / rel_inc).resolve()
+        local_inc_path = dest_root / including_file.relative_to(dest_root).parent / rel_inc
+
+        repo_inc_path = repo_inc_path.resolve()
+        local_inc_path = local_inc_path.resolve()
+
+        if repo_inc_path in seen:
+            continue
+        if not repo_inc_path.exists():
+            print(f"[include] Warning: {rel_inc} referenced from {including_file} not found in repo.")
+            continue
+
+        seen.add(repo_inc_path)
+        copy_file(repo_inc_path, local_inc_path)
+        _copy_includes_recursive(source_root, dest_root, local_inc_path, seen)
+
+###############################################################################
+# reuse/ aggregation                                                          #
+###############################################################################
+
+def _collect_reuse_fragments(repo_label: str, repo_root: Path) -> None:
+    """Read links.txt / substitutions.txt under *repo_root*/docs/reuse/ and cache them."""
+    reuse_dir = repo_root / "docs" / "reuse"
+    if not reuse_dir.is_dir():
+        return
+
+    for kind in ("links", "substitutions"):
+        txt = reuse_dir / f"{kind}.txt"
+        if txt.is_file():
+            with txt.open("r", encoding="utf-8", errors="ignore") as fh:
+                lines = [ln.rstrip("\n") for ln in fh if ln.strip()]  # keep non-blank lines
+            if lines:
+                _REUSE_CACHE[kind].append((repo_label, lines))
 
 
-def build_discourse_toc(name, dest_dir, doc_files):
-    """
-    For Discourse, typically there's 1 doc (an index or a single .md),
-    so we always label with SourceName.
-    """
-    lines = []
-    for doc_file in doc_files:
-        if dest_dir:
-            lines.append(f"{name} <{dest_dir}/{doc_file}>")
-        else:
-            lines.append(f"{name} <{doc_file}>")
-    return lines
+def _write_reuse(output_dir: Path) -> None:
+    dest_reuse = output_dir / "reuse"
+    if not any(_REUSE_CACHE.values()):
+        return  # nothing to write
+
+    dest_reuse.mkdir(parents=True, exist_ok=True)
+
+    for kind in ("links", "substitutions"):
+        if not _REUSE_CACHE[kind]:
+            continue
+        out_file = dest_reuse / f"{kind}.txt"
+        with out_file.open("w", encoding="utf-8") as fh:
+            for label, lines in _REUSE_CACHE[kind]:
+                fh.write(f".. {label}:\n")
+                fh.write("\n".join(lines))
+                fh.write("\n\n")  # blank line separator
+
+###############################################################################
+# GitHub-specific processing                                                  #
+###############################################################################
+
+def _clone_repo_shallow(repo_url: str, branch: str, clone_to: Path) -> None:
+    print(f"[git] Cloning {repo_url}@{branch} → {clone_to} (depth 1)")
+    Repo.clone_from(repo_url, to_path=str(clone_to), branch=branch, multi_options=["--depth=1"])
 
 
-TOC_BUILDERS = {
-    "github": build_github_toc,
-    "discourse": build_discourse_toc,
-}
+def _gather_github_top_level(dest_dir: Path) -> List[str]:
+    for idx in ("index.md", "index.rst"):
+        if (dest_dir / idx).is_file():
+            return [idx]
+    return [f.name for f in dest_dir.iterdir() if f.is_file() and f.suffix in {".md", ".rst"}]
 
 
-def clone_repo_shallow(repo_url, branch, clone_to):
-    """Shallow clone of a Git repo into 'clone_to' directory."""
-    print(f"Cloning {repo_url} @ {branch} -> {clone_to} (shallow)…")
-    Repo.clone_from(
-        repo_url,
-        to_path=clone_to,
-        branch=branch,
-        multi_options=["--depth=1"],
-    )
+def handle_github_source(src: Dict, full_path: str | Path) -> List[str]:
+    repo_url: str = src["repo_url"]
+    branch: str = src.get("branch", "main")
+    doc_subdir: str = src.get("doc_subdir", "")
 
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        _clone_repo_shallow(repo_url, branch, tmpdir)
 
-def fetch_discourse_topic(base_url, topic_id, title):
-    """
-    Fetch raw Markdown from Discourse, removing content after '-------------------------'.
-    The final returned text is pre-pended with '# <title>\n\n'.
-    """
+        src_subdir = tmpdir / doc_subdir
+        if not src_subdir.exists():
+            print(f"[git] Warning: subdir '{doc_subdir}' not found in {repo_url}.")
+            Path(full_path).mkdir(parents=True, exist_ok=True)
+            return []
+
+        # Collect reuse/ first using repo name as label (root-level docs/reuse/)
+        repo_label = src.get("reuse_label") or Path(repo_url).stem  # default label
+        _collect_reuse_fragments(repo_label, tmpdir)
+
+        dest_root = Path(full_path)
+        dest_root.mkdir(parents=True, exist_ok=True)
+
+        include_seen: Set[Path] = set()
+        doc_files: List[str] = []
+
+        if "pages" in src:  # selective copy
+            for page in src["pages"]:
+                in_repo = src_subdir / page["doc_file"]
+                if not in_repo.is_file():
+                    print(f"[git] Warning: '{page['doc_file']}' missing in repo; skipping.")
+                    continue
+                local_name = page.get("filename") or in_repo.name
+                out_file = dest_root / local_name
+                copy_file(in_repo, out_file)
+                doc_files.append(local_name)
+
+                _copy_includes_recursive(src_subdir, dest_root, out_file, include_seen)
+        else:  # full copy of doc_subdir
+            copy_tree(src_subdir, dest_root)
+            for rst in dest_root.rglob("*.rst"):
+                _copy_includes_recursive(src_subdir, dest_root, rst, include_seen)
+            doc_files.extend(_gather_github_top_level(dest_root))
+
+        return doc_files
+
+###############################################################################
+# Discourse (unchanged)                                                       #
+###############################################################################
+
+def fetch_discourse_topic(base_url: str, topic_id: int, title: str) -> str:
     url = f"{base_url}/raw/{topic_id}"
-    print(f"Fetching Discourse topic {topic_id} from {url}...")
+    print(f"[disc] Fetch {url}")
     resp = requests.get(url)
     resp.raise_for_status()
 
@@ -103,20 +228,14 @@ def fetch_discourse_topic(base_url, topic_id, title):
     cutoff_index = content.find("-------------------------")
     if cutoff_index != -1:
         content = content[:cutoff_index].rstrip()
-
     return content
 
 
-def create_discourse_index(directory, section_name, pages):
-    """
-    Create an index.md that links to pages in this directory.
-    Returns the filename of the created index.md, or None if the directory doesn't exist.
-    """
-    if not os.path.isdir(directory):
+def create_discourse_index(directory: Path, section_name: str, pages: List[Dict]) -> str | None:
+    if not directory.is_dir():
         return None
 
-    lines = []
-    lines.append(f"# {section_name}\n\n")
+    lines: List[str] = [f"# {section_name}\n\n"]
     for page in pages:
         lines.append(f"## {page['title']}\n\n")
         lines.append("```{toctree}\n:maxdepth: 1\n\n")
@@ -124,247 +243,155 @@ def create_discourse_index(directory, section_name, pages):
         lines.append(f"{base}\n")
         lines.append("```\n\n")
 
-    index_path = os.path.join(directory, "index.md")
-    with open(index_path, "w", encoding="utf-8") as f:
+    index_path = directory / "index.md"
+    with index_path.open("w", encoding="utf-8") as f:
         f.writelines(lines)
-
     return "index.md"
 
 
-def gather_github_top_level(dest_dir):
-    """
-    For GitHub docs (the 'full subdir' scenario), if there's a top-level
-    index.md or index.rst, return only that. Otherwise return all top-level .md/.rst files.
-    """
-    if not os.path.isdir(dest_dir):
-        return []
-
-    idx_md = os.path.join(dest_dir, "index.md")
-    idx_rst = os.path.join(dest_dir, "index.rst")
-
-    if os.path.isfile(idx_md):
-        return ["index.md"]
-    elif os.path.isfile(idx_rst):
-        return ["index.rst"]
-
-    files = []
-    for name in os.listdir(dest_dir):
-        path = os.path.join(dest_dir, name)
-        if os.path.isfile(path) and (name.endswith(".md") or name.endswith(".rst")):
-            files.append(name)
-    return files
-
-
-def handle_github_source(src, full_path):
-    """
-    Clones repo, then either:
-      - If 'pages' given, copy only those listed files from repo_subdir.
-      - Else copy the entire doc_subdir, returning top-level docs (like index.md).
-    """
-    repo_url = src["repo_url"]
-    branch = src.get("branch", "main")
-    doc_subdir = src.get("doc_subdir", "")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        clone_repo_shallow(repo_url, branch, tmpdir)
-        src_subdir = os.path.join(tmpdir, doc_subdir)
-
-        if not os.path.exists(src_subdir):
-            print(f"Warning: subdir '{doc_subdir}' not found in {repo_url}.")
-            os.makedirs(full_path, exist_ok=True)
-            return []
-
-        # If user explicitly listed pages to include
-        if "pages" in src:
-            os.makedirs(full_path, exist_ok=True)
-            doc_files = []
-            for page in src["pages"]:
-                in_repo = os.path.join(src_subdir, page["doc_file"])
-                if not os.path.isfile(in_repo):
-                    print(
-                        f"Warning: file '{page['doc_file']}' not found in {doc_subdir}. Skipping."
-                    )
-                    continue
-                local_name = page.get("filename") or os.path.basename(page["doc_file"])
-                out_file = os.path.join(full_path, local_name)
-                copy_file(in_repo, out_file)
-                doc_files.append(local_name)
-
-            return doc_files
-
-        # Else copy entire doc_subdir
-        copy_tree(src_subdir, full_path)
-        return gather_github_top_level(full_path)
-
-
-def handle_discourse_source(src, full_path):
-    """
-    Fetch Discourse topics, write them locally, then create a subdir index.
-    Returns list containing the index.md (if successful).
-    """
-    os.makedirs(full_path, exist_ok=True)
+def handle_discourse_source(src: Dict, full_path: str | Path) -> List[str]:
+    dest = Path(full_path)
+    dest.mkdir(parents=True, exist_ok=True)
     for p in src.get("pages", []):
         md_text = fetch_discourse_topic(src["discourse_url"], p["topic_id"], p["title"])
         fname = p.get("filename", f"{p['topic_id']}.md")
-        with open(os.path.join(full_path, fname), "w", encoding="utf-8") as fmd:
+        with (dest / fname).open("w", encoding="utf-8") as fmd:
             fmd.write(md_text)
+    idx = create_discourse_index(dest, src["name"], src["pages"])
+    return [idx] if idx else []
 
-    index_file = create_discourse_index(
-        directory=full_path, section_name=src["name"], pages=src["pages"]
-    )
-    return [index_file] if index_file else []
 
+###############################################################################
+# Public API                                                                  #
+###############################################################################
+
+TOC_BUILDERS = {
+    "github": lambda n, d, f: [f"{d}/{df}" if d else df for df in f]
+    if len(f) > 1
+    else [f"{n} <{d}/{f[0]}>" if d else f"{n} <{f[0]}>"],
+    "discourse": lambda n, d, f: [
+        f"{n} <{d}/{df}>" if d else f"{n} <{df}>" for df in f
+    ],
+}
 
 SOURCE_HANDLERS = {
     "github": handle_github_source,
     "discourse": handle_discourse_source,
 }
 
+###############################################################################
+# Index generation (unchanged)                                                #
+###############################################################################
 
-def merge_docs(manifest_path, output_dir):
-    """
-    Merges documentation from multiple sources into 'output_dir'.
-    Each source is placed at output_dir/(category/)?(dest_dir)?,
-    and we build the top-level index + category sub-indexes accordingly.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    with open(manifest_path, encoding="utf-8") as f:
+
+def build_all_indices(output_dir: Path, source_entries: List[Dict]) -> None:
+    cat_map: Dict[str | None, List[Dict]] = defaultdict(list)
+    for e in source_entries:
+        cat_map[e.get("category")].append(e)
+
+    root_index = output_dir / "index.md"
+    lines = ["# Related Technologies\n\n"]
+
+    categories = sorted([c for c in cat_map if c is not None])
+    if categories:
+        lines.append("```{toctree}\n:maxdepth: 1\n\n")
+        for cat in categories:
+            lines.append(f"{cat}/index\n")
+        lines.append("\n```\n\n")
+
+    # Sources without category
+    for src in cat_map.get(None, []):
+        if not src["docs"]:
+            continue
+        builder = TOC_BUILDERS.get(src["type"])
+        if not builder:
+            continue
+        lines.append("```{toctree}\n:maxdepth: 1\n\n")
+        lines.extend(
+            [ln + "\n" for ln in builder(src["name"], src["dest_dir"], src["docs"])]
+        )
+        lines.append("\n```\n\n")
+
+    with root_index.open("w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    # Category sub‑indices
+    for cat in categories:
+        cat_dir = output_dir / cat
+        (cat_dir).mkdir(parents=True, exist_ok=True)
+        cat_index_path = cat_dir / "index.md"
+
+        lines_cat: List[str] = [f"# {cat}\n\n"]
+        for src in cat_map[cat]:
+            if not src["docs"]:
+                continue
+            builder = TOC_BUILDERS.get(src["type"])
+            if not builder:
+                continue
+            lines_cat.append("```{toctree}\n:maxdepth: 1\n\n")
+            lines_cat.extend(
+                [ln + "\n" for ln in builder(src["name"], src["dest_dir"], src["docs"])]
+            )
+            lines_cat.append("\n```\n\n")
+
+        with cat_index_path.open("w", encoding="utf-8") as f:
+            f.writelines(lines_cat)
+
+
+###############################################################################
+# Orchestrator                                                                #
+###############################################################################
+
+
+def merge_docs(manifest_path: str | Path, output_dir: str | Path) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with Path(manifest_path).open(encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    source_entries = []
+    source_entries: List[Dict] = []
 
     for src in config.get("sources", []):
         stype = src["type"]
-        sname = src["name"]
-        category = src.get("category")  # optional
-        raw_dest = src.get("dest_dir", "").rstrip("/")
-
-        # Physical directory = output_dir / category? / dest_dir?
-        if category:
-            full_path = (
-                os.path.join(output_dir, category, raw_dest)
-                if raw_dest
-                else os.path.join(output_dir, category)
-            )
-        else:
-            full_path = os.path.join(output_dir, raw_dest) if raw_dest else output_dir
-
-        os.makedirs(full_path, exist_ok=True)
-
         handler = SOURCE_HANDLERS.get(stype)
         if handler is None:
-            print(f"Warning: No handler found for source type '{stype}'. Skipping...")
+            print(f"[warn] No handler for source type '{stype}'. Skipping…")
             continue
 
-        doc_files = handler(src, full_path)
+        category = src.get("category")
+        raw_dest = src.get("dest_dir", "").rstrip("/")
+        if category:
+            full_path = (
+                output_dir / category / raw_dest if raw_dest else output_dir / category
+            )
+        else:
+            full_path = output_dir / raw_dest if raw_dest else output_dir
 
+        docs = handler(src, full_path)
         source_entries.append(
             {
                 "type": stype,
-                "name": sname,
+                "name": src["name"],
                 "category": category,
-                "dest_dir": raw_dest,  # keep the user-specified path
-                "docs": doc_files,
+                "dest_dir": raw_dest,
+                "docs": docs,
             }
         )
 
     build_all_indices(output_dir, source_entries)
+    _write_reuse(Path("."))
 
 
-def build_all_indices(output_dir, source_entries):
-    """
-    Builds:
-    1) A root index named "index.md" with heading "Related Technologies".
-    2) Category subfolders each get an index referencing their sources.
-    3) Sources with no category appear directly at root-level (as before).
-    """
-
-    # Group sources by category (None => no category)
-    from collections import defaultdict
-
-    cat_map = defaultdict(list)
-    for e in source_entries:
-        cat_map[e.get("category")].append(e)
-
-    # Start root index
-    root_index = os.path.join(output_dir, "index.md")
-    lines = ["# Related Technologies\n\n"]
-
-    # Collect categories (non-None) and sort them for consistent ordering
-    categories = sorted([c for c in cat_map.keys() if c is not None])
-
-    if categories:
-        lines.append("```{toctree}\n:maxdepth: 1\n\n")
-        for cat in categories:
-            # We'll store the category index at output_dir/<cat>/index.md
-            # So from the root's perspective, it’s "<cat>/index"
-            lines.append(f"{cat}/index\n")
-        lines.append("\n```\n\n")
-
-    no_category_sources = cat_map.get(None, [])
-    for src in no_category_sources:
-        stype = src["type"]
-        name = src["name"]
-        doc_files = src["docs"]
-        raw_dest = src["dest_dir"]
-
-        # If no docs, skip
-        if not doc_files:
-            continue
-
-        builder = TOC_BUILDERS.get(stype)
-        if not builder:
-            continue
-
-        lines.append("```{toctree}\n:maxdepth: 1\n\n")
-
-        toc_lines = map(lambda x: x + "\n", builder(name, raw_dest, doc_files))
-        lines.extend(toc_lines)
-        lines.append("\n```\n\n")
-
-    with open(root_index, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-
-    # Build an index per category
-    for cat in categories:
-        cat_dir = os.path.join(output_dir, cat)
-        os.makedirs(cat_dir, exist_ok=True)
-        cat_index_path = os.path.join(cat_dir, "index.md")
-
-        lines_cat = [f"# {cat}\n\n"]
-        for src in cat_map[cat]:
-            stype = src["type"]
-            name = src["name"]
-            doc_files = src["docs"]
-            raw_dest = src["dest_dir"]  # subfolder under this category
-
-            if not doc_files:
-                continue
-            builder = TOC_BUILDERS.get(stype)
-            if not builder:
-                continue
-
-            lines_cat.append("```{toctree}\n:maxdepth: 1\n\n")
-
-            # If user had "raw_dest", the actual doc paths are category/dest_dir/filename
-            # But from this category’s perspective, we only need "dest_dir/filename".
-            # If raw_dest is empty, docs are at cat_dir/<filename>.
-            # So the toctree reference is simply something like "subDir/doc.md" or "doc.md".
-            toc_lines = map(lambda x: x + "\n", builder(name, raw_dest, doc_files))
-            lines_cat.extend(toc_lines)
-            lines_cat.append("\n```\n\n")
-
-        with open(cat_index_path, "w", encoding="utf-8") as f:
-            f.writelines(lines_cat)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", required=True, help="Path to the YAML manifest.")
-    parser.add_argument(
-        "--output", default="docs", help="Output directory for merged docs."
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Merge multiple documentation sources into a Sphinx‑ready tree."
     )
-    args = parser.parse_args()
+    p.add_argument("--manifest", required=True, help="YAML manifest file.")
+    p.add_argument(
+        "--output", default="docs", help="Destination directory (default: docs/)"
+    )
+    args = p.parse_args()
     merge_docs(args.manifest, args.output)
 
 
